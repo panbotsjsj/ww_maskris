@@ -1,15 +1,14 @@
 """
-Werewolf Discord Bot  (v2 — Tim Werewolf, Warga, dan Netral)
------------------------------------------------------------
-- Lobby dengan tombol Join / Leave / Start
-- Host bisa pilih ikut main atau spectate (tombol 👁️ Spectate)
-- Role bisa ditambah / dihapus (/ww role add|remove|auto|list) untuk balancing
-- Setiap role beraksi malam bisa diatur aksinya mulai malam ke-berapa (/ww role night)
-  (jalan pintas: /ww setting malam_bunuh:N untuk Werewolf, malam_bunuh_sk:N untuk Serial Killer)
-- Role TIDAK diumumkan saat pemain mati (tetap rahasia sampai game selesai)
-- Channel private khusus Werewolf dengan select menu korban
-- Semua role dengan aksi malam memakai UI interaktif yang hanya terlihat oleh pemainnya (ephemeral)
-- Malam -> Siang (diskusi + pemerasan/bungkam) -> Voting, otomatis sampai ada pemenang
+Werewolf Discord Bot  (v3 -- aksi malam via DM)
+----------------------------------------------
+- Lobby: Join / Leave / Start, host bisa ikut main atau spectate
+- Semua aksi malam dikirim VIA DM ke pemilik role
+  (tombol kirim-ulang di channel sebagai fallback bila DM gagal)
+- Komposisi role: /ww role add|remove|auto|list
+- Aksi tiap role malam bisa diatur mulai malam ke-berapa (/ww role night)
+- Role tidak diumumkan saat pemain mati (dibuka saat game selesai)
+- Channel private Werewolf untuk strategi; voting korban via DM
+- Alur: Malam -> Siang (diskusi + pemerasan/bungkam) -> Voting
 """
 from __future__ import annotations
 
@@ -36,12 +35,12 @@ log = logging.getLogger("werewolf")
 logging.basicConfig(level=logging.INFO)
 
 MIN_PLAYERS = int(os.getenv("MIN_PLAYERS", "4"))
-MAX_PLAYERS = 24  # select menu Discord maks 25 opsi (24 pemain + opsi "skip")
+MAX_PLAYERS = 24  # select menu Discord maks 25 opsi
 LOCK_CHAT_AT_NIGHT = os.getenv("LOCK_CHAT_AT_NIGHT", "1") == "1"
-WOLF_KILL_NIGHT = max(1, int(os.getenv("WOLF_KILL_NIGHT", "1")))  # Werewolf boleh membunuh mulai malam ke-N
-SK_KILL_NIGHT = max(1, int(os.getenv("SK_KILL_NIGHT", "1")))      # Serial Killer boleh membunuh mulai malam ke-N
+WOLF_KILL_NIGHT = max(1, int(os.getenv("WOLF_KILL_NIGHT", "1")))
+SK_KILL_NIGHT = max(1, int(os.getenv("SK_KILL_NIGHT", "1")))
+DPR_SILENCE_NIGHT = max(1, int(os.getenv("DPR_SILENCE_NIGHT", "1")))
 HUNTER_TIME = 30
-WITCH_TIME = 30
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -63,48 +62,68 @@ TEAMS = {
 }
 
 ROLES: dict[str, RoleInfo] = {r.key: r for r in [
-    # ───── Tim Werewolf ─────
-    RoleInfo("werewolf", "🐺", "Werewolf", "wolf",
-             "Berkelompok dengan sesama Werewolf di channel private. Tiap malam memilih **1 korban** untuk dimakan."),
-    RoleInfo("werewolf_kid", "🐺", "Werewolf Kid", "wolf",
-             "Sama seperti Werewolf biasa. Jika dia **dibakar (di-BAKARRR! lewat voting)**, malam berikutnya "
-             "Werewolf bisa memakan **2 orang**."),
-    RoleInfo("sorcerer", "🧿", "Sorcerer", "wolf",
-             "Kamu **tahu siapa saja Werewolf** (mereka tidak tahu kamu). Tiap malam pilih 1 pemain untuk dicek "
-             "apakah dia **Seer**. Tidak ikut memilih korban."),
-    RoleInfo("blackmailer", "😈", "Blackmailer", "wolf",
-             "Tiap malam pilih 1 target **dan role yang harus dia akui**. Target wajib mengaku di depan umum "
-             "(lewat tombol) sebelum fase siang berakhir, kalau tidak dia **dibunuh**."),
-    RoleInfo("dpr", "🤐", "DPR", "wolf",
-             "Tiap malam **membungkam 1 orang** (tidak bisa chat sepanjang siang berikutnya). "
-             "Malam selanjutnya tidak boleh membungkam orang yang sama."),
     # ───── Tim Warga ─────
     RoleInfo("villager", "👤", "Villager", "village",
              "Warga biasa tanpa kekuatan khusus. Andalkan diskusi dan voting."),
     RoleInfo("seer", "🔮", "Seer", "village",
-             "Tiap malam cek **role asli** satu pemain. Hasilnya hanya kamu yang lihat."),
-    RoleInfo("doctor", "💉", "Doctor", "village",
-             "Tiap malam lindungi 1 pemain (boleh diri sendiri) dari serangan malam (Werewolf & Serial Killer). "
-             "Tidak boleh orang yang sama 2 malam berturut-turut."),
-    RoleInfo("witch", "🧙", "Witch", "village",
-             "1 ramuan penyelamat + 1 ramuan racun (sekali pakai). Kamu diberi tahu korban Werewolf malam itu. "
-             "Satu aksi per malam."),
+             "Tiap malam **scan 1 orang** via DM. Hasil: **W** = dia tim Werewolf, **V** = bukan Werewolf."),
+    RoleInfo("guardian", "🛡️", "Guardian", "village",
+             "Tiap malam **lindungi 1 orang** via DM (boleh diri sendiri) dari serangan malam. "
+             "Tidak boleh melindungi orang yang sama 2 malam berturut-turut."),
+    RoleInfo("drunk", "🍺", "Drunk", "village",
+             "Kamu **tidak tahu role aslimu**. Pada **malam ke-3** role aslimu diungkap via DM dan bisa kamu gunakan."),
     RoleInfo("hunter", "🏹", "Hunter", "village",
-             "Saat mati (dibunuh/di-BAKARRR!/diracun) kamu boleh menembak 1 pemain untuk ikut mati."),
+             "Saat mati (dibunuh/di-bakar/diracun/ditembak) kamu boleh menembak 1 pemain untuk ikut mati."),
+    RoleInfo("gunner", "🔫", "Gunner", "village",
+             "Kamu punya **1 peluru**. Tiap malam via DM kamu bisa memilih menembak 1 orang atau tidak. "
+             "Sekali ditembakkan, peluru habis."),
+    RoleInfo("prince", "👑", "Prince", "village",
+             "Jika kamu **di-vote (bakar)**, role-mu terungkap ke semua orang dan **tidak ada yang dibakar** hari itu."),
+    RoleInfo("diseased", "🤢", "Diseased", "village",
+             "Jika kamu **dimakan Werewolf** (dan tewas), para Werewolf akan sakit dan "
+             "**tidak bisa memangsa di malam berikutnya**."),
+    RoleInfo("cursed", "🌚", "Cursed", "village",
+             "Kamu seperti warga biasa. Tapi jika **dimakan Werewolf**, kamu tidak mati -- "
+             "kamu **berubah menjadi Werewolf**!"),
+    RoleInfo("aura_seer", "👁️", "Aura Seer", "village",
+             "Tiap malam **cek 1 pemain** via DM. Kamu diberi tahu **tim**-nya: Warga, Werewolf, atau Netral."),
+    RoleInfo("gravekeeper", "🪦", "Gravekeeper", "village",
+             "Tiap malam **periksa 1 mayat** via DM untuk mengetahui **role asli** pemain yang sudah mati."),
+    # ───── Tim Werewolf ─────
+    RoleInfo("werewolf", "🐺", "Werewolf", "wolf",
+             "Berkelompok dengan sesama Werewolf. Tiap malam **pilih korban via DM** (diskusikan dulu di channel pack)."),
+    RoleInfo("werewolf_kid", "🐕", "Werewolf Kid", "wolf",
+             "Sama seperti Werewolf biasa. Jika dia **dibakar (di-bakar)**, malam berikutnya "
+             "Werewolf bisa memakan **2 orang**."),
+    RoleInfo("sorcerer", "🧿", "Sorcerer", "wolf",
+             "Kamu **tahu siapa saja Werewolf** (mereka tidak tahu kamu). Tiap malam via DM pilih 1 pemain "
+             "untuk dicek apakah dia **Seer**."),
+    RoleInfo("blackmailer", "😈", "Blackmailer", "wolf",
+             "Tiap malam via DM pilih 1 target **dan role yang harus dia akui**. Target wajib mengaku di depan umum "
+             "sebelum fase siang berakhir, kalau tidak dia **dibunuh**."),
+    RoleInfo("dpr", "🤐", "DPR", "wolf",
+             "Tiap malam via DM **membungkam 1 orang** (tidak bisa chat sepanjang siang berikutnya). "
+             "Malam selanjutnya tidak boleh membungkam orang yang sama."),
     # ───── Netral ─────
     RoleInfo("tanner", "🤡", "Tanner", "neutral",
-             "Menang **sendirian** jika kamu mati karena **voting (di-BAKARRR!)**. Game langsung selesai."),
+             "Menang **sendirian** jika kamu mati karena **voting (di-bakar)**. Game langsung selesai."),
     RoleInfo("blamer", "👉", "Blamer", "neutral",
-             "Di **malam pertama** pilih **2 orang** sebagai target. Jika keduanya mati dan kamu masih hidup, kamu menang."),
+             "Di **malam pertama** via DM pilih **2 orang** sebagai target. "
+             "Jika keduanya mati dan kamu masih hidup, kamu menang."),
     RoleInfo("serial_killer", "🔪", "Serial Killer", "neutral",
-             "Tiap malam membunuh **1 orang**. Menang jika kamu adalah **orang terakhir yang bertahan**."),
+             "Tiap malam via DM membunuh **1 orang**. Menang jika kamu adalah **orang terakhir yang bertahan**."),
 ]}
 
 PACK = {"werewolf", "werewolf_kid"}         # anggota channel Werewolf & pemilih korban
-KNOWS_WOLVES = {"sorcerer"}                 # role yang tahu siapa Werewolf (tambah "blackmailer", "dpr" jika mau)
-NIGHT_REQUIRED = {"seer", "doctor", "sorcerer", "blackmailer", "dpr", "serial_killer"}
-# role yang aksinya bisa diatur mulai malam ke-berapa (blamer khusus malam 1, hunter/tanner pasif)
-NIGHT_ACTION_ROLES = ["werewolf", "seer", "doctor", "witch", "sorcerer", "blackmailer", "dpr", "serial_killer"]
+KNOWS_WOLVES = {"sorcerer"}                 # role yang tahu siapa Werewolf
+NIGHT_REQUIRED = {"seer", "guardian", "aura_seer", "gravekeeper", "gunner",
+                  "sorcerer", "blackmailer", "dpr", "serial_killer"}
+# role yang aksinya bisa diatur mulai malam ke-berapa
+NIGHT_ACTION_ROLES = ["werewolf", "seer", "guardian", "aura_seer", "gravekeeper", "gunner",
+                      "sorcerer", "blackmailer", "dpr", "serial_killer"]
+# Pool role asli Drunk (diundi saat game mulai, terungkap malam ke-3)
+DRUNK_POOL = ["seer", "guardian", "aura_seer", "gravekeeper", "gunner",
+              "hunter", "prince", "diseased", "cursed"]
 
 
 def auto_roles(n: int) -> dict[str, int]:
@@ -117,8 +136,10 @@ def auto_roles(n: int) -> dict[str, int]:
     cfg: dict[str, int] = {"werewolf": total_wolf - len(extras)}
     for k in extras:
         cfg[k] = 1
-    for min_n, key in [(5, "seer"), (6, "doctor"), (7, "hunter"), (8, "witch"),
-                       (10, "tanner"), (12, "serial_killer"), (14, "blamer")]:
+    for min_n, key in [(5, "seer"), (6, "guardian"), (7, "hunter"), (8, "aura_seer"),
+                       (9, "gunner"), (10, "gravekeeper"), (11, "drunk"), (12, "prince"),
+                       (13, "diseased"), (14, "cursed"), (15, "tanner"),
+                       (16, "serial_killer"), (18, "blamer")]:
         if n >= min_n:
             cfg[key] = 1
     return cfg
@@ -134,9 +155,9 @@ class Player:
         self.id = member.id
         self.role = "villager"
         self.alive = True
-        self.heal = 1                  # Witch
-        self.poison = 1
-        self.last_protected: Optional[int] = None   # Doctor
+        self.bullet = 1                        # Gunner
+        self.true_role: Optional[str] = None   # Drunk: role asli (terungkap malam ke-3)
+        self.last_protected: Optional[int] = None   # Guardian
         self.last_silenced: Optional[int] = None    # DPR
         self.blame_targets: list[int] = []          # Blamer
 
@@ -186,25 +207,20 @@ class RoleClaimSelect(discord.ui.Select):
         await self.game.handle_bm_role(interaction, self.values[0])
 
 
-class WolfVoteView(discord.ui.View):
-    def __init__(self, game: "Game", targets: list[Player], kills: int):
-        super().__init__(timeout=None)
-        ph = "🐺 Pilih korban malam ini" if kills == 1 else f"🐺 Pilih sampai {kills} korban malam ini"
-        self.add_item(TargetSelect(game, "wolf", targets, ph, max_values=kills))
-
-
 class VoteView(discord.ui.View):
     def __init__(self, game: "Game"):
         super().__init__(timeout=None)
-        self.add_item(TargetSelect(game, "vote", game.alive(), "🗳️ Pilih pemain yang mau di-BAKARRR!", allow_skip=True))
+        self.add_item(TargetSelect(game, "vote", game.alive(), "🗳️ Pilih pemain yang mau di-bakar", allow_skip=True))
 
 
 class NightPanelView(discord.ui.View):
+    """Tombol fallback: kirim ulang aksi malam ke DM (mis. DM pertama tidak masuk)."""
+
     def __init__(self, game: "Game"):
         super().__init__(timeout=None)
         self.game = game
 
-    @discord.ui.button(label="Aksi Malam", emoji="🌙", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Kirim Ulang Aksi ke DM", emoji="🔔", style=discord.ButtonStyle.primary)
     async def act(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.game.open_night_action(interaction)
 
@@ -241,6 +257,8 @@ class ConfessView(discord.ui.View):
 
 
 class RoleView(discord.ui.View):
+    """Fallback bila DM role tidak masuk."""
+
     def __init__(self, game: "Game"):
         super().__init__(timeout=None)
         self.game = game
@@ -251,68 +269,7 @@ class RoleView(discord.ui.View):
         p = g.players.get(interaction.user.id)
         if not p:
             return await interaction.response.send_message("Kamu tidak ikut game ini.", ephemeral=True)
-        te, tn = TEAMS[p.team]
-        color = {"wolf": discord.Color.red(), "village": discord.Color.green(), "neutral": discord.Color.gold()}[p.team]
-        e = discord.Embed(title=f"{p.info.emoji} Kamu adalah {p.info.name}", description=p.info.desc, color=color)
-        e.add_field(name="Tim", value=f"{te} {tn}")
-        e.add_field(name="Status", value="❤️ Hidup" if p.alive else "💀 Mati")
-        if p.role in PACK:
-            mates = ", ".join(w.member.mention for w in g.players.values() if w.role in PACK)
-            e.add_field(name="Anggota pack", value=mates, inline=False)
-        elif p.role in KNOWS_WOLVES:
-            wolves = ", ".join(w.member.mention for w in g.players.values() if w.role in PACK)
-            e.add_field(name="🐺 Werewolf yang kamu ketahui", value=wolves or "-", inline=False)
-        if p.role == "blamer" and p.blame_targets:
-            e.add_field(name="🎯 Targetmu", value=", ".join(g.players[t].member.mention for t in p.blame_targets), inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-class WitchView(discord.ui.View):
-    def __init__(self, game: "Game", witch: Player):
-        super().__init__(timeout=120)
-        self.game = game
-        self.witch = witch
-        self.save_btn.disabled = not (game.night_victims and witch.heal > 0)
-        self.poison_btn.disabled = witch.poison <= 0
-
-    async def _expired(self, interaction: discord.Interaction) -> bool:
-        if self.game.stage != "witch":
-            await interaction.response.edit_message(content="⏰ Waktu aksi sudah habis.", view=None)
-            return True
-        return False
-
-    @discord.ui.button(label="Selamatkan korban", emoji="💚", style=discord.ButtonStyle.success)
-    async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await self._expired(interaction):
-            return
-        g = self.game
-        if len(g.night_victims) == 1:
-            self.witch.heal -= 1
-            g.witch_saved.append(g.night_victims[0])
-            g.acted.add(self.witch.id)
-            await interaction.response.edit_message(content="💚 Kamu menggunakan ramuan penyelamat.", view=None)
-            g.check_done()
-        else:
-            v = discord.ui.View(timeout=120)
-            v.add_item(TargetSelect(g, "witch_save", [g.players[x] for x in g.night_victims], "💚 Pilih korban yang diselamatkan"))
-            await interaction.response.edit_message(content="💚 Siapa yang ingin kamu selamatkan?", view=v)
-
-    @discord.ui.button(label="Racuni seseorang", emoji="☠️", style=discord.ButtonStyle.danger)
-    async def poison_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await self._expired(interaction):
-            return
-        cands = [p for p in self.game.alive() if p.id != self.witch.id]
-        v = discord.ui.View(timeout=120)
-        v.add_item(TargetSelect(self.game, "poison", cands, "☠️ Pilih target racun"))
-        await interaction.response.edit_message(content="☠️ Siapa yang mau kamu racuni?", view=v)
-
-    @discord.ui.button(label="Lewati", emoji="⏭️", style=discord.ButtonStyle.secondary)
-    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await self._expired(interaction):
-            return
-        self.game.acted.add(self.witch.id)
-        await interaction.response.edit_message(content="⏭️ Kamu tidak memakai ramuan malam ini.", view=None)
-        self.game.check_done()
+        await interaction.response.send_message(embed=g.role_embed(p), ephemeral=True)
 
 
 class LobbyView(discord.ui.View):
@@ -386,10 +343,14 @@ class Game:
         self.custom_roles: Optional[dict[str, int]] = None
         self.night_time, self.day_time, self.vote_time = 60, 90, 45
         self.host_playing = True        # host ikut main / spectate
-        self.wolf_kill_night = WOLF_KILL_NIGHT  # Werewolf boleh membunuh mulai malam ke-N
+        self.wolf_kill_night = WOLF_KILL_NIGHT      # Werewolf boleh membunuh mulai malam ke-N
         self.wolf_active_night = False  # di-set tiap malam di night_phase
-        self.sk_kill_night = SK_KILL_NIGHT      # Serial Killer boleh membunuh mulai malam ke-N
+        self.sk_kill_night = SK_KILL_NIGHT          # Serial Killer boleh membunuh mulai malam ke-N
+        self.dpr_silence_night = DPR_SILENCE_NIGHT  # DPR boleh membungkam mulai malam ke-N
         self.role_start_night: dict[str, int] = {}  # role -> aksi mulai malam ke-N (default 1)
+        self.wolf_sick = False          # True jika Diseased dimakan -> wolf tidak bisa memangsa besok
+        self.kid_revenge = False        # True jika Werewolf Kid di-lynch -> 2 korban di malam aktif berikutnya
+        self.kills = 1
         self.lobby_message: Optional[discord.Message] = None
         self.wolf_channel: Optional[discord.TextChannel] = None
         self.task: Optional[asyncio.Task] = None
@@ -397,21 +358,18 @@ class Game:
         self._orig_send: Optional[bool] = None
         self._locked = False
 
-        self.stage: Optional[str] = None  # night / witch / discuss / vote / hunter
+        self.stage: Optional[str] = None  # night / discuss / vote / hunter
         self.event = asyncio.Event()
 
         # state malam
-        self.kills = 1
-        self.kid_revenge = False
         self.wolf_votes: dict[int, list[int]] = {}
         self.acted: set[int] = set()
-        self.doctor_targets: list[int] = []
+        self.guard_targets: list[int] = []
         self.night_victims: list[int] = []
         self.sk_targets: list[int] = []
+        self.gunner_shots: list[int] = []
         self.silence_targets: list[int] = []
         self.silenced: list[int] = []
-        self.witch_saved: list[int] = []
-        self.witch_poisons: list[int] = []
         self.bm_pending: dict[int, int] = {}
         self.blackmails: list[dict] = []
         # voting & hunter
@@ -432,6 +390,14 @@ class Game:
     async def say(self, *args, **kwargs):
         return await self.channel.send(*args, **kwargs)
 
+    async def dm(self, p: Player, *args, **kwargs):
+        """Kirim DM ke pemain. Return message jika berhasil, None jika gagal (DM ditutup)."""
+        try:
+            return await p.member.send(*args, **kwargs)
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("DM gagal ke %s", p.name)
+            return None
+
     def role_plan(self) -> dict[str, int]:
         n = len(self.players)
         base = dict(self.custom_roles) if self.custom_roles is not None else auto_roles(n)
@@ -449,6 +415,8 @@ class Game:
             return self.wolf_kill_night
         if role == "serial_killer":
             return self.sk_kill_night
+        if role == "dpr":
+            return self.dpr_silence_night
         return self.role_start_night.get(role, 1)
 
     def role_unlocked(self, role: str) -> bool:
@@ -457,16 +425,7 @@ class Game:
 
     def night_overrides(self) -> list[tuple[str, int]]:
         """Daftar (role, malam) yang diubah dari default, untuk ditampilkan di lobby."""
-        out: list[tuple[str, int]] = []
-        if self.wolf_kill_night > 1:
-            out.append(("werewolf", self.wolf_kill_night))
-        if self.sk_kill_night > 1:
-            out.append(("serial_killer", self.sk_kill_night))
-        for k in ("seer", "doctor", "witch", "sorcerer", "blackmailer", "dpr"):
-            n = self.role_start_night.get(k, 1)
-            if n > 1:
-                out.append((k, n))
-        return out
+        return [(k, self.role_start(k)) for k in NIGHT_ACTION_ROLES if self.role_start(k) > 1]
 
     def validate(self, plan: dict[str, int]) -> Optional[str]:
         n = len(self.players)
@@ -487,7 +446,8 @@ class Game:
         host_mode = "🎮 ikut main" if self.host_playing else "👁️ spectate"
         e.description = (f"Host: {self.host.mention} ({host_mode})\n"
                          "Klik **Join** untuk ikut. Host menekan **Start** jika sudah siap.\n"
-                         "Host bisa pakai tombol **👁️ Spectate** untuk tidak ikut main.")
+                         "Host bisa pakai tombol **👁️ Spectate** untuk tidak ikut main.\n"
+                         "⚠️ **Pastikan DM dari server terbuka** — role & aksi malam dikirim via DM!")
         plist = "\n".join(f"{i}. {p.member.mention}" for i, p in enumerate(self.players.values(), 1))
         e.add_field(name=f"Pemain ({len(self.players)}/{MAX_PLAYERS})", value=plist or "-", inline=False)
         mode = "otomatis" if self.custom_roles is None else "kustom"
@@ -548,7 +508,28 @@ class Game:
                 ow[p.member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
         self.wolf_channel = await self.guild.create_text_channel(
             "werewolf-pack", category=self.channel.category, overwrites=ow,
-            topic="Channel rahasia Werewolf. Pilih korban tiap malam lewat select menu.")
+            topic="Channel rahasia Werewolf. Diskusikan strategi di sini; pilih korban tiap malam via DM.")
+
+    # ─────────────── embed role untuk DM ───────────────
+    def role_embed(self, p: Player) -> discord.Embed:
+        te, tn = TEAMS[p.team]
+        color = {"wolf": discord.Color.red(), "village": discord.Color.green(),
+                 "neutral": discord.Color.gold()}[p.team]
+        e = discord.Embed(title=f"{p.info.emoji} Kamu adalah {p.info.name}",
+                          description=p.info.desc, color=color)
+        e.add_field(name="Tim", value=f"{te} {tn}")
+        if p.role in PACK:
+            mates = ", ".join(w.name for w in self.players.values() if w.role in PACK and w.id != p.id)
+            e.add_field(name="🐺 Anggota pack", value=mates or "Hanya kamu", inline=False)
+        elif p.role in KNOWS_WOLVES:
+            wolves = ", ".join(w.name for w in self.players.values() if w.role in PACK)
+            e.add_field(name="🐺 Werewolf yang kamu ketahui", value=wolves or "-", inline=False)
+        if p.role == "drunk":
+            e.add_field(name="🍺 Mabuk", value="Role aslimu masih dirahasiakan — akan terungkap di **malam ke-3**.",
+                        inline=False)
+        e.add_field(name="🌙 Aksi malam", value="Semua aksi malammu dikirim **via DM** oleh bot setiap malam.",
+                    inline=False)
+        return e
 
     # ─────────────── mulai game ───────────────
     async def begin(self, interaction: discord.Interaction):
@@ -558,7 +539,7 @@ class Game:
         err = self.validate(plan)
         if err:
             return await interaction.response.send_message(f"❌ {err}", ephemeral=True)
-        await interaction.response.send_message("✅ Membagikan role...", ephemeral=True)
+        await interaction.response.send_message("✅ Membagikan role via DM...", ephemeral=True)
 
         roles: list[str] = []
         for k, c in plan.items():
@@ -566,6 +547,10 @@ class Game:
         random.shuffle(roles)
         for p, r in zip(self.players.values(), roles):
             p.role = r
+        # Drunk: undi role asli (disembunyikan sampai malam ke-3)
+        for p in self.players.values():
+            if p.role == "drunk":
+                p.true_role = random.choice(DRUNK_POOL)
 
         try:
             await self.create_wolf_channel()
@@ -584,22 +569,33 @@ class Game:
                 pass
 
         e = discord.Embed(title="🌕 Game Werewolf Dimulai!", color=discord.Color.dark_purple(),
-                          description="Role sudah dibagikan. Klik tombol di bawah untuk melihat role kamu (hanya kamu yang bisa lihat).")
+                          description="Role sudah dikirim **via DM** ke masing-masing pemain!\n"
+                                      "Klik tombol 🎭 di bawah jika DM tidak masuk.")
         e.add_field(name="Komposisi", value=self.plan_text(plan))
         e.add_field(name="Pemain", value=", ".join(p.member.mention for p in self.players.values()), inline=False)
         await self.say(embed=e, view=RoleView(self))
+
+        failed = []
+        for p in self.players.values():
+            if not await self.dm(p, embed=self.role_embed(p)):
+                failed.append(p)
+        if failed:
+            await self.say("⚠️ " + ", ".join(x.member.mention for x in failed) +
+                           "\nTidak bisa menerima DM dari bot! Aktifkan **Privacy Settings → "
+                           "Allow direct messages from server members**, atau klik tombol 🎭 di atas untuk melihat role.")
 
         pack = [p for p in self.players.values() if p.role in PACK]
         await self.wolf_channel.send(
             "🐺 **Selamat datang di sarang Werewolf!**\n"
             f"Pack kamu: {', '.join(w.member.mention for w in pack)}\n"
-            "Setiap malam, pilih korban lewat select menu. Diskusikan strategi di sini — jangan ketahuan!")
+            "Setiap malam, pilih korban **via DM** (bot akan mengirim pilihannya). "
+            "Diskusikan strategi di sini — jangan ketahuan!")
         self.task = asyncio.create_task(self.run())
 
     # ─────────────── loop utama ───────────────
     async def run(self):
         try:
-            await asyncio.sleep(8)
+            await asyncio.sleep(10)
             while True:
                 self.round += 1
                 if await self.night_phase():
@@ -642,22 +638,16 @@ class Game:
         except asyncio.TimeoutError:
             pass
 
-    def witches_needed(self) -> list[Player]:
-        return [w for w in self.alive_role("witch")
-                if self.role_unlocked("witch") and (w.poison > 0 or (w.heal > 0 and self.night_victims))]
-
     def check_done(self):
         """Set event jika semua yang wajib bertindak pada stage ini sudah selesai."""
         done = False
         if self.stage == "night":
             need = [p for p in self.alive() if p.role in NIGHT_REQUIRED]
             blamers = [p for p in self.alive_role("blamer") if not p.blame_targets] if self.round == 1 else []
-            # di malam saat Werewolf belum boleh membunuh, vote korban tidak ditunggu
+            # di malam saat Werewolf belum boleh membunuh / sedang sakit, vote korban tidak ditunggu
             wolves_ok = True if not self.wolf_active_night else all(w.id in self.wolf_votes for w in self.alive_pack())
             done = (wolves_ok
                     and all(p.id in self.acted for p in need) and not blamers)
-        elif self.stage == "witch":
-            done = all(w.id in self.acted for w in self.witches_needed())
         elif self.stage == "vote":
             done = all(p.id in self.votes for p in self.alive())
         elif self.stage == "hunter":
@@ -691,13 +681,18 @@ class Game:
         elif kind == "sk":
             e = discord.Embed(title="🔪 SERIAL KILLER MENANG!", description=f"{player.member.mention} adalah orang terakhir yang bertahan.", color=discord.Color.dark_gold())
         elif kind == "tanner":
-            e = discord.Embed(title="🤡 TANNER MENANG!", description=f"{player.member.mention} berhasil membuat desa me-BAKARRR! dirinya.", color=discord.Color.gold())
+            e = discord.Embed(title="🤡 TANNER MENANG!", description=f"{player.member.mention} berhasil membuat desa me-bakar dirinya.", color=discord.Color.gold())
         elif kind == "blamer":
             e = discord.Embed(title="👉 BLAMER MENANG!", description=f"{player.member.mention} sukses — kedua targetnya mati dan dia masih hidup.", color=discord.Color.gold())
         else:
             e = discord.Embed(title="☠️ Tidak ada pemenang", description="Semua pemain tewas.", color=discord.Color.dark_grey())
-        lines = [f"{p.info.emoji} {p.member.mention} — **{p.info.name}** ({TEAMS[p.team][1]}) {'❤️' if p.alive else '💀'}"
-                 for p in self.players.values()]
+        lines = []
+        for p in self.players.values():
+            rname = p.info.name
+            if p.role == "drunk" and p.true_role:
+                rname = f"Drunk (aslinya {ROLES[p.true_role].name})"
+            lines.append(f"{p.info.emoji} {p.member.mention} — **{rname}** ({TEAMS[p.team][1]}) "
+                         f"{'❤️' if p.alive else '💀'}")
         e.add_field(name="Role semua pemain", value="\n".join(lines), inline=False)
         await self.say(embed=e)
 
@@ -712,24 +707,34 @@ class Game:
     async def night_phase(self) -> bool:
         self.wolf_votes.clear()
         self.acted.clear()
-        self.doctor_targets.clear()
+        self.guard_targets.clear()
         self.night_victims = []
         self.sk_targets.clear()
+        self.gunner_shots.clear()
         self.silence_targets.clear()
-        self.witch_saved.clear()
-        self.witch_poisons.clear()
         self.bm_pending.clear()
         self.blackmails.clear()
-        # Werewolf hanya boleh membunuh mulai malam ke-wolf_kill_night
-        self.wolf_active_night = self.round >= self.wolf_kill_night
+
+        # 🍺 Drunk: role asli terungkap di malam ke-3
+        if self.round == 3:
+            for d in self.alive_role("drunk"):
+                if d.true_role:
+                    d.role = d.true_role
+                    r = ROLES[d.role]
+                    await self.dm(d, f"🍺 **Malam ke-3!** Kepalamu sudah jernih...\n"
+                                     f"Role aslimu ternyata adalah {r.emoji} **{r.name}**!\n{r.desc}")
+
+        # 🤢 Werewolf sakit (efek Diseased) / belum mencapai malam boleh membunuh
+        sick_tonight = self.wolf_sick
+        self.wolf_sick = False
+        self.wolf_active_night = self.round >= self.wolf_kill_night and not sick_tonight
         if self.wolf_active_night:
             self.kills = 2 if self.kid_revenge else 1
-            revenge = self.kid_revenge
-            self.kid_revenge = False
+            self.kid_revenge = False  # balas dendam hanya dikonsumsi di malam bisa membunuh
         else:
             self.kills = 0
-            revenge = False  # balas dendam Werewolf Kid disimpan sampai malam boleh membunuh
-        # kunci aksi malam per role yang belum mencapai malam mulainya
+
+        # kunci aksi role yang belum mencapai malam mulainya
         # (otomatis dianggap selesai supaya fase malam tidak macet menunggu)
         for _p in self.alive():
             if _p.role in NIGHT_REQUIRED and not self.role_unlocked(_p.role):
@@ -737,30 +742,42 @@ class Game:
 
         await self.set_lock(True)
         e = discord.Embed(title=f"🌙 Malam ke-{self.round}", color=discord.Color.dark_blue(),
-                          description=f"Desa tertidur... Pemain dengan aksi malam, klik **Aksi Malam**.\n"
-                                      f"Warga biasa cukup menunggu. Berakhir {fmt_time(self.night_time)}")
+                          description="Desa tertidur... 😴\nPemain dengan aksi malam, **cek DM** dari bot!\n"
+                                      "_(DM tidak masuk? Klik tombol 🔔 di bawah untuk kirim ulang.)_\n"
+                                      f"Berakhir {fmt_time(self.night_time)}")
+        if sick_tonight:
+            e.add_field(name="🤢 Werewolf Sakit!",
+                        value="Para Werewolf keracunan dan **tidak bisa memangsa malam ini**.", inline=False)
         panel = await self.say(embed=e, view=NightPanelView(self))
 
-        wolf_msg = None
         pack = self.alive_pack()
-        if pack and self.wolf_active_night:
-            targets = [p for p in self.alive() if p.role not in PACK]
-            txt = f"🌙 **Malam ke-{self.round}** — pilih korban {fmt_time(self.night_time)}.\nSuara terbanyak dipakai (seri = acak)."
-            if revenge:
-                txt += "\n🩸 **Werewolf Kid telah dibakar!** Malam ini kalian boleh memakan **2 korban**."
-            if targets:
-                wolf_msg = await self.wolf_channel.send(txt, view=WolfVoteView(self, targets, self.kills))
-        elif pack:
-            await self.wolf_channel.send(
-                f"🌙 **Malam ke-{self.round}** — Werewolf belum boleh membunuh "
-                f"(baru boleh mulai malam ke-{self.wolf_kill_night}). Manfaatkan waktu untuk menyusun strategi! 😴")
+        if pack and not self.wolf_active_night:
+            reason = (f"belum boleh membunuh (mulai malam ke-{self.wolf_kill_night})"
+                      if self.round < self.wolf_kill_night else "sedang sakit 🤢")
+            try:
+                await self.wolf_channel.send(f"🌙 **Malam ke-{self.round}** — pack {reason}. "
+                                             "Manfaatkan untuk strategi! 😴")
+            except discord.HTTPException:
+                pass
 
         self.stage = "night"
         self.event.clear()
+        for p in self.alive():
+            await self.send_night_action_dm(p)
         self.check_done()
         await self.wait(self.night_time)
+        self.stage = None
+        try:
+            await panel.edit(view=None)
+        except discord.HTTPException:
+            pass
 
-        # tentukan korban Werewolf
+        # Gunner yang tidak memilih dianggap tidak menembak
+        for g in self.alive_role("gunner"):
+            if g.bullet > 0 and g.id not in self.acted and self.role_unlocked("gunner"):
+                self.acted.add(g.id)
+
+        # tentukan korban Werewolf (suara terbanyak, seri = acak)
         pool = dict(Counter(t for ts in self.wolf_votes.values() for t in ts))
         victims: list[int] = []
         while pool and len(victims) < self.kills:
@@ -769,34 +786,25 @@ class Game:
             victims.append(pick)
             pool.pop(pick)
         self.night_victims = victims
-        if wolf_msg:
-            try:
-                await wolf_msg.edit(view=None)
-            except discord.HTTPException:
-                pass
 
-        # tahap Witch
-        if self.witches_needed():
-            self.stage = "witch"
-            self.event.clear()
-            await self.wait(WITCH_TIME)
-        self.stage = None
-        try:
-            await panel.edit(view=None)
-        except discord.HTTPException:
-            pass
-
-        # resolusi
-        protected, saved = set(self.doctor_targets), set(self.witch_saved)
+        # resolusi serangan malam
+        protected = set(self.guard_targets)
         deaths: list[int] = []
         for v in self.night_victims:
-            if v not in protected and v not in saved and v not in deaths:
+            if v in protected or v in deaths:
+                continue
+            pv = self.players[v]
+            if pv.role == "cursed":
+                await self.transform_cursed(pv)
+            else:
                 deaths.append(v)
+                if pv.role == "diseased":
+                    self.wolf_sick = True  # Werewolf sakit di malam berikutnya
         for t in self.sk_targets:
             if t not in protected and t not in deaths:
                 deaths.append(t)
-        for t in self.witch_poisons:
-            if t not in deaths:
+        for t in self.gunner_shots:
+            if t not in protected and t not in deaths:
                 deaths.append(t)
 
         await self.set_lock(False)
@@ -809,6 +817,9 @@ class Game:
             # role TIDAK diumumkan — tetap rahasia sampai game selesai
             lines.append(f"💀 {p.member.mention} ditemukan tewas.")
         e.description = "\n".join(lines) if lines else "✨ Malam ini tidak ada yang tewas."
+        if self.wolf_sick:
+            e.add_field(name="🤢", value="Para Werewolf terlihat sakit-sakitan... mereka tidak bisa memangsa besok malam!",
+                        inline=False)
 
         # DPR membungkam
         self.silenced = [t for t in dict.fromkeys(self.silence_targets) if self.players[t].alive]
@@ -819,12 +830,31 @@ class Game:
                 except discord.HTTPException:
                     pass
             e.add_field(name="🤐 Dibungkam DPR",
-                        value="\n".join(f"{self.players[t].member.mention} tidak boleh bicara sepanjang hari ini." for t in self.silenced),
+                        value="\n".join(f"{self.players[t].member.mention} tidak boleh bicara sepanjang hari ini."
+                                        for t in self.silenced),
                         inline=False)
         await self.say(embed=e)
 
         await self.hunter_chain(deaths)
         return await self.finish_if_ended()
+
+    async def transform_cursed(self, p: Player):
+        """Cursed yang dimakan Werewolf berubah menjadi Werewolf (tidak mati)."""
+        p.role = "werewolf"
+        if self.wolf_channel:
+            try:
+                await self.wolf_channel.set_permissions(p.member, view_channel=True,
+                                                        send_messages=True, read_message_history=True)
+            except discord.HTTPException:
+                pass
+            try:
+                await self.wolf_channel.send(
+                    f"🌚 **{p.member.mention}** dimakan... tapi kutukan mengubahnya! "
+                    "Dia kini menjadi **Werewolf** dan bergabung dengan pack. 🤫")
+            except discord.HTTPException:
+                pass
+        await self.dm(p, "🌚 Kamu dimakan Werewolf... tapi bukannya mati, **kutukan mengubahmu menjadi Werewolf**!\n"
+                         "Cek channel werewolf-pack untuk berkoordinasi. Jangan sampai ketahuan!")
 
     # ─────────────── FASE SIANG ───────────────
     async def day_phase(self) -> bool:
@@ -832,9 +862,22 @@ class Game:
         await self.say(f"💬 **Diskusi** dimulai! Berakhir {fmt_time(self.day_time)}\n"
                        f"Pemain hidup ({len(self.alive())}): {alive_txt}\n"
                        f"*(Host bisa `/ww skip` untuk langsung ke voting)*")
+
+        # DM target pemerasan Blackmailer
+        for b in self.blackmails:
+            t = self.players[b["target"]]
+            if t.alive:
+                role = ROLES[b["role"]]
+                await self.dm(t,
+                              f"😈 **Kamu sedang diperas!**\nKamu harus mengaku di depan umum sebagai "
+                              f"**{role.emoji} {role.name}** sebelum fase siang berakhir (termasuk voting). "
+                              f"Jika tidak, kamu akan **dibunuh**.\n"
+                              f"(Mengaku tidak harus jujur — tapi kamu harus mengatakannya.)",
+                              view=ConfessView(self, b))
         panel = None
-        if self.blackmails or self.alive_role("blackmailer"):
-            panel = await self.say("📩 Ada pesan rahasia untukmu? Klik tombol ini (semua pemain bisa klik).", view=DayPanelView(self))
+        if self.blackmails:
+            panel = await self.say("📩 Ada pesan rahasia untukmu? Klik tombol ini (semua pemain bisa klik).",
+                                   view=DayPanelView(self))
 
         self.stage = "discuss"
         self.event.clear()
@@ -842,7 +885,7 @@ class Game:
 
         # voting
         self.votes.clear()
-        msg = await self.say(f"🗳️ **Voting!** Pilih siapa yang di-BAKARRR!. Berakhir {fmt_time(self.vote_time)}\n"
+        msg = await self.say(f"🗳️ **Voting!** Pilih siapa yang di-bakar. Berakhir {fmt_time(self.vote_time)}\n"
                              "Kamu bisa mengganti pilihan selama waktu belum habis.", view=VoteView(self))
         self.stage = "vote"
         self.event.clear()
@@ -868,25 +911,31 @@ class Game:
 
         e = discord.Embed(title="📊 Hasil Voting", description=detail, color=discord.Color.orange())
         if lynched is None:
-            e.add_field(name="Hasil", value="Seri / mayoritas skip — tidak ada yang di-BAKARRR!.")
+            e.add_field(name="Hasil", value="Seri / mayoritas skip — tidak ada yang di-bakar.")
             await self.say(embed=e)
         else:
             p = self.players[lynched]
-            p.alive = False
-            await self.mute(p)
-            # role TIDAK diumumkan — tetap rahasia sampai game selesai
-            e.add_field(name="Hasil", value=f"🔥 {p.member.mention} di-BAKARRR!")
-            await self.say(embed=e)
+            if p.role == "prince":
+                # 👑 Prince: role terungkap, tidak ada yang dibakar
+                e.add_field(name="Hasil",
+                            value=f"👑 {p.member.mention} ternyata adalah **Prince**! Tidak ada yang dibakar hari ini.")
+                await self.say(embed=e)
+            else:
+                p.alive = False
+                await self.mute(p)
+                # role TIDAK diumumkan — tetap rahasia sampai game selesai
+                e.add_field(name="Hasil", value=f"🔥 {p.member.mention} di-bakar!")
+                await self.say(embed=e)
 
-            if p.role == "tanner":
-                await self.announce_end("tanner", p)
-                return True
-            if p.role == "werewolf_kid":
-                self.kid_revenge = True
-                await self.say("🩸 *Werewolf Kid mati terbakar... para serigala akan lebih buas malam nanti.*")
-            await self.hunter_chain([lynched])
-            if await self.finish_if_ended():
-                return True
+                if p.role == "tanner":
+                    await self.announce_end("tanner", p)
+                    return True
+                if p.role == "werewolf_kid":
+                    self.kid_revenge = True
+                    await self.say("🩸 *Werewolf Kid mati terbakar... para serigala akan lebih buas malam nanti.*")
+                await self.hunter_chain([lynched])
+                if await self.finish_if_ended():
+                    return True
 
         # eksekusi Blackmailer di akhir fase siang
         killed: list[int] = []
@@ -901,7 +950,8 @@ class Game:
                 lines.append(f"😈 {t.member.mention} tidak mematuhi perintah pemeras dan **dibunuh**!")
         self.blackmails.clear()
         if lines:
-            await self.say(embed=discord.Embed(title="🩸 Korban Pemerasan", description="\n".join(lines), color=discord.Color.dark_red()))
+            await self.say(embed=discord.Embed(title="🩸 Korban Pemerasan", description="\n".join(lines),
+                                               color=discord.Color.dark_red()))
             await self.hunter_chain(killed)
             if await self.finish_if_ended():
                 return True
@@ -949,83 +999,156 @@ class Game:
             if t.role == "hunter":
                 queue.append(t.id)
 
-    # ─────────────── AKSI MALAM (tombol publik) ───────────────
+    # ─────────────── PROMPT AKSI MALAM (via DM) ───────────────
+    def _sel_view(self, kind: str, cands: list[Player], placeholder: str,
+                  min_values: int = 1, max_values: int = 1, allow_skip: bool = False) -> discord.ui.View:
+        v = discord.ui.View(timeout=None)
+        v.add_item(TargetSelect(self, kind, cands, placeholder,
+                                min_values=min_values, max_values=max_values, allow_skip=allow_skip))
+        return v
+
+    def build_night_prompt(self, p: Player) -> Optional[tuple[str, discord.ui.View]]:
+        """Bangun (teks, view) aksi malam untuk pemain. None jika tidak ada aksi."""
+        if not p.alive or self.state != "running":
+            return None
+        role = p.role
+        rnd = self.round
+
+        if role in PACK:
+            if self.stage != "night" or not self.wolf_active_night:
+                return None
+            targets = [x for x in self.alive() if x.role not in PACK]
+            if not targets:
+                return None
+            txt = (f"🐺 **Malam ke-{rnd}** — pilih korban (berakhir {fmt_time(self.night_time)}).\n"
+                   "Suara terbanyak dipakai (seri = acak).")
+            if self.kills > 1:
+                txt += "\n🩸 **Balas dendam Werewolf Kid!** Kamu bisa memilih sampai 2 korban."
+            ph = "🐺 Pilih korban" + (" (maks 2)" if self.kills > 1 else "")
+            return txt, self._sel_view("wolf", targets, ph, max_values=self.kills)
+
+        if self.stage != "night" or p.id in self.acted:
+            return None
+        if role in NIGHT_REQUIRED and not self.role_unlocked(role):
+            return None
+
+        others = [x for x in self.alive() if x.id != p.id]
+        if role == "seer":
+            if not others:
+                return None
+            return (f"🔮 **Malam ke-{rnd}** — siapa yang ingin kamu scan?\n"
+                    "Hasil: **W** = tim Werewolf 🐺, **V** = bukan Werewolf.",
+                    self._sel_view("seer", others, "🔮 Pilih pemain yang di-scan"))
+        if role == "aura_seer":
+            if not others:
+                return None
+            return (f"👁️ **Malam ke-{rnd}** — aura siapa yang ingin kamu cek?\n"
+                    "Kamu akan diberi tahu timnya (Warga / Werewolf / Netral).",
+                    self._sel_view("aura_seer", others, "👁️ Pilih pemain yang dicek"))
+        if role == "guardian":
+            cands = [x for x in self.alive() if x.id != p.last_protected]
+            if not cands:
+                return None
+            note = "\n*(Tidak boleh melindungi orang yang sama 2 malam berturut-turut)*" if p.last_protected else ""
+            return (f"🛡️ **Malam ke-{rnd}** — siapa yang ingin kamu lindungi?{note}",
+                    self._sel_view("guardian", cands, "🛡️ Pilih yang dilindungi"))
+        if role == "gravekeeper":
+            dead = [x for x in self.players.values() if not x.alive]
+            if not dead:
+                return None
+            return (f"🪦 **Malam ke-{rnd}** — mayat siapa yang ingin kamu periksa?",
+                    self._sel_view("gravekeeper", dead, "🪦 Pilih mayat"))
+        if role == "gunner":
+            if p.bullet <= 0 or not others:
+                return None
+            return (f"🔫 **Malam ke-{rnd}** — kamu punya **1 peluru**.\n"
+                    "Pilih target untuk ditembak, atau **Skip** bila tidak ingin menembak.",
+                    self._sel_view("gunner", others, "🔫 Tembak seseorang? (atau lewati)", allow_skip=True))
+        if role == "sorcerer":
+            cands = [x for x in others if x.role not in PACK]
+            if not cands:
+                return None
+            return (f"🧿 **Malam ke-{rnd}** — siapa yang kamu curigai sebagai **Seer**?",
+                    self._sel_view("sorcerer", cands, "🧿 Pilih yang dicek"))
+        if role == "dpr":
+            cands = [x for x in others if x.id != p.last_silenced]
+            if not cands:
+                return None
+            note = "\n*(Tidak boleh membungkam orang yang sama 2 malam berturut-turut)*" if p.last_silenced else ""
+            return (f"🤐 **Malam ke-{rnd}** — siapa yang ingin kamu bungkam besok?{note}",
+                    self._sel_view("dpr", cands, "🤐 Pilih yang dibungkam"))
+        if role == "serial_killer":
+            if not others:
+                return None
+            return (f"🔪 **Malam ke-{rnd}** — siapa yang akan kamu bunuh?",
+                    self._sel_view("sk", others, "🔪 Pilih korban"))
+        if role == "blackmailer":
+            cands = [x for x in others if x.role not in PACK]
+            if not cands:
+                return None
+            return (f"😈 **Malam ke-{rnd}** — siapa target pemerasanmu?\n"
+                    "(Setelah ini pilih role yang harus dia akui.)",
+                    self._sel_view("bm_target", cands, "😈 Pilih target"))
+        if role == "blamer":
+            if rnd != 1 or p.blame_targets or len(others) < 2:
+                return None
+            return (f"👉 **Malam pertama** — pilih **2 orang** yang harus mati agar kamu menang.",
+                    self._sel_view("blamer", others, "👉 Pilih 2 target", min_values=2, max_values=2))
+        return None
+
+    async def send_night_action_dm(self, p: Player) -> bool:
+        """Kirim prompt aksi malam via DM. Return True jika terkirim."""
+        prompt = self.build_night_prompt(p)
+        if not prompt:
+            return False
+        text, view = prompt
+        try:
+            await p.member.send(text, view=view)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("DM aksi malam gagal ke %s", p.name)
+            return False
+
+    def _idle_text(self, role: str) -> str:
+        return {
+            "villager": "👤 Kamu warga biasa. Tidur nyenyak... 😴",
+            "drunk": "🍺 Kamu masih mabuk... role aslimu terungkap di malam ke-3.",
+            "hunter": "🏹 Hunter tidak punya aksi malam. Kekuatanmu aktif saat kamu mati.",
+            "prince": "👑 Prince tidak punya aksi malam. Jika kamu di-vote, role-mu terungkap dan tidak ada yang dibakar!",
+            "diseased": "🤢 Diseased tidak punya aksi malam. Jika kamu dimakan Werewolf, mereka akan sakit besok malamnya.",
+            "cursed": "🌚 Kamu seperti warga biasa. Jika dimakan Werewolf, kamu akan berubah menjadi Werewolf!",
+            "tanner": "🤡 Tanner tidak punya aksi malam. Buat desa me-bakar dirimu!",
+            "werewolf": "🐺 Pack belum bisa memangsa (tunggu malam yang ditentukan host). Diskusikan strategi di channel pack!",
+            "werewolf_kid": "🐺 Pack belum bisa memangsa (tunggu malam yang ditentukan host). Diskusikan strategi di channel pack!",
+        }.get(role, "😴 Tidak ada aksi malam untukmu. Tidur nyenyak...")
+
     async def open_night_action(self, interaction: discord.Interaction):
+        """Fallback: tombol 🔔 kirim ulang aksi malam ke DM (atau tampilkan langsung bila DM gagal)."""
         send = interaction.response.send_message
         p = self.players.get(interaction.user.id)
         if not p:
             return await send("Kamu tidak ikut game ini.", ephemeral=True)
         if not p.alive:
             return await send("💀 Kamu sudah mati.", ephemeral=True)
-        if self.stage not in ("night", "witch"):
-            return await send("Bukan waktunya beraksi.", ephemeral=True)
-        role = p.role
-
-        if role in PACK:
-            return await send(f"🐺 Gunakan channel {self.wolf_channel.mention} untuk memilih korban.", ephemeral=True)
-
-        if role == "witch":
-            if not self.role_unlocked("witch"):
-                return await send(f"🧙 Aksimu baru terbuka mulai malam ke-{self.role_start('witch')}. Tidur dulu... 😴",
-                                  ephemeral=True)
-            if self.stage != "witch":
-                return await send("⏳ Tunggu Werewolf menentukan korban, lalu klik tombol ini lagi.", ephemeral=True)
-            if p.id in self.acted:
-                return await send("🧙 Kamu sudah bertindak malam ini.", ephemeral=True)
-            if p.heal <= 0 and p.poison <= 0:
-                return await send("🧙 Ramuanmu sudah habis.", ephemeral=True)
-            victims = ", ".join(self.players[v].member.mention for v in self.night_victims) or "*tidak ada*"
-            txt = (f"🧙 Korban Werewolf malam ini: {victims}\n"
-                   f"Ramuan penyelamat: **{p.heal}** • Ramuan racun: **{p.poison}**\nPilih satu aksi:")
-            return await send(txt, view=WitchView(self, p), ephemeral=True)
-
-        # kunci aksi malam yang belum mencapai malam mulainya
-        if role in ("seer", "sorcerer", "doctor", "dpr", "blackmailer", "serial_killer") and not self.role_unlocked(role):
-            return await send(f"{ROLES[role].emoji} Aksimu baru terbuka mulai malam ke-{self.role_start(role)}. Tidur dulu... 😴",
-                              ephemeral=True)
-
-        # semua role di bawah hanya aktif pada stage "night"
-        others = [x for x in self.alive() if x.id != p.id]
-        spec = None  # (kind, kandidat, placeholder, prompt, min, max)
-        if role == "seer":
-            spec = ("seer", others, "🔮 Pilih pemain yang dicek", "🔮 Siapa yang ingin kamu intip role-nya?", 1, 1)
-        elif role == "sorcerer":
-            spec = ("sorcerer", [x for x in others if x.role not in PACK], "🧿 Pilih pemain yang dicek",
-                    "🧿 Siapa yang kamu curigai sebagai **Seer**?", 1, 1)
-        elif role == "doctor":
-            note = "\n*(Tidak boleh melindungi orang yang sama 2 malam berturut-turut)*" if p.last_protected else ""
-            spec = ("doctor", [x for x in self.alive() if x.id != p.last_protected], "💉 Pilih pemain yang dilindungi",
-                    f"💉 Siapa yang ingin kamu lindungi malam ini?{note}", 1, 1)
-        elif role == "dpr":
-            note = "\n*(Tidak boleh membungkam orang yang sama 2 malam berturut-turut)*" if p.last_silenced else ""
-            spec = ("dpr", [x for x in others if x.id != p.last_silenced], "🤐 Pilih pemain yang dibungkam",
-                    f"🤐 Siapa yang ingin kamu bungkam besok?{note}", 1, 1)
-        elif role == "serial_killer":
-            spec = ("sk", others, "🔪 Pilih korban", "🔪 Siapa yang akan kamu bunuh malam ini?", 1, 1)
-        elif role == "blackmailer":
-            spec = ("bm_target", [x for x in others if x.role not in PACK], "😈 Pilih target pemerasan",
-                    "😈 Siapa yang ingin kamu peras? (setelah itu pilih role yang harus dia akui)", 1, 1)
-        elif role == "blamer":
-            if self.round != 1 or p.blame_targets:
-                return await send("👉 Kamu sudah menentukan targetmu. Tunggu mereka mati...", ephemeral=True)
-            spec = ("blamer", others, "👉 Pilih 2 target", "👉 Pilih **2 orang** yang harus mati agar kamu menang.", 2, 2)
-        elif role == "hunter":
-            return await send("🏹 Hunter tidak punya aksi malam. Kekuatanmu aktif saat kamu mati.", ephemeral=True)
-        elif role == "tanner":
-            return await send("🤡 Tanner tidak punya aksi malam. Buat desa me-BAKARRR! dirimu!", ephemeral=True)
-        else:
-            return await send("👤 Kamu warga biasa. Tidur nyenyak... 😴", ephemeral=True)
-
-        kind, cands, ph, prompt, mn, mx = spec
         if self.stage != "night":
-            return await send("Fase aksi malam sudah lewat.", ephemeral=True)
+            return await send("Bukan waktunya beraksi.", ephemeral=True)
         if p.id in self.acted:
             return await send("✅ Kamu sudah beraksi malam ini.", ephemeral=True)
-        if not cands:
-            return await send("Tidak ada target yang tersedia.", ephemeral=True)
-        v = discord.ui.View(timeout=120)
-        v.add_item(TargetSelect(self, kind, cands, ph, min_values=mn, max_values=mx))
-        await send(prompt, view=v, ephemeral=True)
+        if p.role in PACK:
+            if p.id in self.wolf_votes:
+                return await send("🐺 Kamu sudah memilih — buka DM dariku untuk mengganti pilihan.", ephemeral=True)
+        elif p.role in NIGHT_REQUIRED and not self.role_unlocked(p.role):
+            r = ROLES[p.role]
+            return await send(f"{r.emoji} Aksimu baru terbuka mulai malam ke-{self.role_start(p.role)}. Tidur dulu... 😴",
+                              ephemeral=True)
+        if await self.send_night_action_dm(p):
+            return await send("📩 Cek DM kamu untuk beraksi!", ephemeral=True)
+        # fallback terakhir: tampilkan langsung (ephemeral) bila DM tetap gagal
+        prompt = self.build_night_prompt(p)
+        if not prompt:
+            return await send(self._idle_text(p.role), ephemeral=True)
+        text, view = prompt
+        await send(text, view=view, ephemeral=True)
 
     # ─────────────── PESAN RAHASIA SIANG (Blackmailer) ───────────────
     async def open_day_message(self, interaction: discord.Interaction):
@@ -1054,26 +1177,39 @@ class Game:
         tid = self.bm_pending.get(interaction.user.id)
         if (not p or not p.alive or p.role != "blackmailer" or self.stage != "night"
                 or tid is None or p.id in self.acted):
-            return await interaction.response.edit_message(content="Aksi tidak valid.", view=None)
+            try:
+                await interaction.response.edit_message(content="Aksi tidak valid.", view=None)
+            except discord.HTTPException:
+                pass
+            return
         self.blackmails.append({"bm": p.id, "target": tid, "role": role_key, "complied": False})
         self.acted.add(p.id)
         self.bm_pending.pop(p.id, None)
         r = ROLES[role_key]
-        await interaction.response.edit_message(
-            content=f"😈 **{self.players[tid].name}** akan diperas: dia harus mengaku sebagai **{r.emoji} {r.name}** besok siang.",
-            view=None)
+        try:
+            await interaction.response.edit_message(
+                content=f"😈 **{self.players[tid].name}** akan diperas: dia harus mengaku sebagai "
+                        f"**{r.emoji} {r.name}** besok siang.",
+                view=None)
+        except discord.HTTPException:
+            pass
         self.check_done()
 
     # ─────────────── HANDLER SEMUA SELECT MENU ───────────────
-    EDIT_KINDS = {"seer", "sorcerer", "doctor", "poison", "dpr", "sk", "blamer", "witch_save", "bm_target"}
-
     async def handle_select(self, interaction: discord.Interaction, kind: str, values: list[str]):
-        async def reply(text: str):
-            if kind in self.EDIT_KINDS:
-                await interaction.response.edit_message(content=text, view=None)
-            else:
-                await interaction.response.send_message(text, ephemeral=True)
+        public = kind in ("vote", "hunter")
 
+        async def reply(text: str):
+            try:
+                if public:
+                    await interaction.response.send_message(text, ephemeral=True)
+                else:
+                    await interaction.response.edit_message(content=text, view=None)
+            except discord.HTTPException:
+                pass
+
+        if self.state != "running":
+            return await reply("Game sudah berakhir.")
         p = self.players.get(interaction.user.id)
         if not p:
             return await reply("Kamu tidak ikut game ini.")
@@ -1102,73 +1238,91 @@ class Game:
             await reply("🐺 Kamu memilih " + ", ".join(f"**{t.name}**" for t in targets) + ".")
             c = Counter(t for ts in self.wolf_votes.values() for t in ts)
             tally = "\n".join(f"• {self.players[t].name}: {n} suara" for t, n in c.most_common())
-            await self.wolf_channel.send(f"🐺 **{p.name}** memilih " + ", ".join(f"**{t.name}**" for t in targets) + f"\n{tally}")
+            try:
+                await self.wolf_channel.send(
+                    f"🐺 **{p.name}** memilih " + ", ".join(f"**{t.name}**" for t in targets) + f"\n{tally}")
+            except discord.HTTPException:
+                pass
 
-        elif kind in ("seer", "sorcerer", "dpr", "sk"):
-            need = {"seer": "seer", "sorcerer": "sorcerer", "dpr": "dpr", "sk": "serial_killer"}[kind]
-            if not night or p.role != need or p.id in self.acted or not target:
+        elif kind in ("seer", "aura_seer", "guardian", "gravekeeper", "gunner", "sorcerer", "dpr", "sk"):
+            need = {"seer": "seer", "aura_seer": "aura_seer", "guardian": "guardian",
+                    "gravekeeper": "gravekeeper", "gunner": "gunner",
+                    "sorcerer": "sorcerer", "dpr": "dpr", "sk": "serial_killer"}[kind]
+            if not night or p.role != need or p.id in self.acted:
                 return await reply("Aksi tidak valid.")
             if kind == "seer":
-                text = (f"🔮 Hasil: **{target.name}** adalah **{target.info.emoji} {target.info.name}** "
-                        f"({TEAMS[target.team][0]} {TEAMS[target.team][1]}).")
+                if not target:
+                    return await reply("Aksi tidak valid.")
+                w = target.team == "wolf"
+                text = (f"🔮 Hasil scan **{target.name}**: **{'W' if w else 'V'}**\n"
+                        + ("🐺 Dia tim **Werewolf**!" if w else "🏘️ Dia **bukan** Werewolf."))
+            elif kind == "aura_seer":
+                if not target:
+                    return await reply("Aksi tidak valid.")
+                te, tn = TEAMS[target.team]
+                text = f"👁️ Aura **{target.name}**: {te} **{tn}**"
+            elif kind == "guardian":
+                if not target:
+                    return await reply("Aksi tidak valid.")
+                if p.last_protected == target.id:
+                    return await reply("Tidak boleh melindungi orang yang sama 2 malam berturut-turut.")
+                p.last_protected = target.id
+                self.guard_targets.append(target.id)
+                text = f"🛡️ Kamu melindungi **{target.name}** malam ini."
+            elif kind == "gravekeeper":
+                if not target:
+                    return await reply("Aksi tidak valid.")
+                r = target.info
+                te, tn = TEAMS[target.team]
+                text = f"🪦 **{target.name}** adalah {r.emoji} **{r.name}** ({te} {tn})."
+            elif kind == "gunner":
+                if p.bullet <= 0:
+                    return await reply("🔫 Pelurumu sudah habis.")
+                if target:
+                    p.bullet -= 1
+                    self.gunner_shots.append(target.id)
+                    text = f"🔫 💥 Kamu menembak **{target.name}**! (Pelurumu habis.)"
+                else:
+                    text = "🔫 Kamu memilih tidak menembak malam ini. Pelurumu masih tersimpan."
             elif kind == "sorcerer":
+                if not target:
+                    return await reply("Aksi tidak valid.")
                 text = (f"🧿 **{target.name}** **ADALAH** Seer!" if target.role == "seer"
                         else f"🧿 **{target.name}** **bukan** Seer.")
             elif kind == "dpr":
+                if not target:
+                    return await reply("Aksi tidak valid.")
                 if p.last_silenced == target.id:
                     return await reply("Tidak boleh membungkam orang yang sama 2 malam berturut-turut.")
                 p.last_silenced = target.id
                 self.silence_targets.append(target.id)
                 text = f"🤐 Kamu akan membungkam **{target.name}** besok."
-            else:  # serial_killer
-                if not self.role_unlocked("serial_killer"):
-                    return await reply("🔪 Kamu belum boleh membunuh (tunggu malam yang ditentukan host).")
+            else:  # sk
+                if not target:
+                    return await reply("Aksi tidak valid.")
                 self.sk_targets.append(target.id)
                 text = f"🔪 Kamu menyerang **{target.name}** malam ini."
             self.acted.add(p.id)
             await reply(text)
 
-        elif kind == "doctor":
-            if not night or p.role != "doctor" or p.id in self.acted or not target:
-                return await reply("Aksi tidak valid.")
-            if p.last_protected == target.id:
-                return await reply("Tidak boleh melindungi orang yang sama 2 malam berturut-turut.")
-            self.acted.add(p.id)
-            self.doctor_targets.append(target.id)
-            p.last_protected = target.id
-            await reply(f"💉 Kamu melindungi **{target.name}** malam ini.")
-
         elif kind == "bm_target":
             if not night or p.role != "blackmailer" or p.id in self.acted or not target:
                 return await reply("Aksi tidak valid.")
             self.bm_pending[p.id] = target.id
-            v = discord.ui.View(timeout=120)
+            v = discord.ui.View(timeout=None)
             v.add_item(RoleClaimSelect(self))
-            return await interaction.response.edit_message(
-                content=f"😈 Target: **{target.name}**. Role apa yang harus dia akui di depan semua orang?", view=v)
+            try:
+                await interaction.response.edit_message(
+                    content=f"😈 Target: **{target.name}**. Role apa yang harus dia akui di depan semua orang?", view=v)
+            except discord.HTTPException:
+                pass
 
         elif kind == "blamer":
             if not night or p.role != "blamer" or p.blame_targets or len(targets) != 2:
                 return await reply("Aksi tidak valid.")
             p.blame_targets = [t.id for t in targets]
-            await reply("👉 Targetmu: " + ", ".join(f"**{t.name}**" for t in targets) + ". Pastikan mereka mati sebelum kamu!")
-
-        elif kind == "poison":
-            if self.stage != "witch" or p.role != "witch" or p.poison <= 0 or p.id in self.acted or not target:
-                return await reply("Aksi tidak valid.")
-            p.poison -= 1
-            self.acted.add(p.id)
-            self.witch_poisons.append(target.id)
-            await reply(f"☠️ Kamu meracuni **{target.name}**.")
-
-        elif kind == "witch_save":
-            if (self.stage != "witch" or p.role != "witch" or p.heal <= 0 or p.id in self.acted
-                    or not target or target.id not in self.night_victims):
-                return await reply("Aksi tidak valid.")
-            p.heal -= 1
-            self.acted.add(p.id)
-            self.witch_saved.append(target.id)
-            await reply(f"💚 Kamu menyelamatkan **{target.name}**.")
+            await reply("👉 Targetmu: " + ", ".join(f"**{t.name}**" for t in targets)
+                        + ". Pastikan mereka mati sebelum kamu!")
 
         elif kind == "vote":
             if self.stage != "vote":
@@ -1209,7 +1363,6 @@ role_group = app_commands.Group(name="role", description="Atur komposisi role", 
 
 ROLE_CHOICES = [app_commands.Choice(name=f"{r.emoji} {r.name} ({TEAMS[r.team][1]})", value=r.key)
                 for r in ROLES.values() if r.key != "villager"]
-NIGHT_ACTION_ROLES = ["werewolf", "seer", "doctor", "witch", "sorcerer", "blackmailer", "dpr", "serial_killer"]
 NIGHT_ROLE_CHOICES = [app_commands.Choice(
     name="🐺 Werewolf (bunuh pack)" if k == "werewolf" else f"{ROLES[k].emoji} {ROLES[k].name}", value=k)
     for k in NIGHT_ACTION_ROLES]
@@ -1289,16 +1442,18 @@ async def ww_status(interaction: discord.Interaction):
         f"**Status:** {g.state} • Ronde {g.round}\n❤️ Hidup: {alive}\n💀 Mati: {dead}", ephemeral=True)
 
 
-@ww.command(name="setting", description="Atur durasi fase & malam mulai boleh membunuh (host, saat lobby)")
+@ww.command(name="setting", description="Atur durasi fase & malam mulai beraksi (host, saat lobby)")
 @app_commands.describe(malam="Durasi malam", diskusi="Durasi diskusi", voting="Durasi voting",
                        malam_bunuh="Werewolf boleh membunuh mulai malam ke-berapa",
-                       malam_bunuh_sk="Serial Killer boleh membunuh mulai malam ke-berapa")
+                       malam_bunuh_sk="Serial Killer boleh membunuh mulai malam ke-berapa",
+                       malam_bungkam="DPR boleh membungkam mulai malam ke-berapa")
 async def ww_setting(interaction: discord.Interaction,
                      malam: Optional[app_commands.Range[int, 20, 300]] = None,
                      diskusi: Optional[app_commands.Range[int, 20, 600]] = None,
                      voting: Optional[app_commands.Range[int, 15, 300]] = None,
                      malam_bunuh: Optional[app_commands.Range[int, 1, 10]] = None,
-                     malam_bunuh_sk: Optional[app_commands.Range[int, 1, 10]] = None):
+                     malam_bunuh_sk: Optional[app_commands.Range[int, 1, 10]] = None,
+                     malam_bungkam: Optional[app_commands.Range[int, 1, 10]] = None):
     g = await lobby_game_for_host(interaction)
     if not g:
         return
@@ -1309,6 +1464,8 @@ async def ww_setting(interaction: discord.Interaction,
         g.wolf_kill_night = malam_bunuh
     if malam_bunuh_sk:
         g.sk_kill_night = malam_bunuh_sk
+    if malam_bungkam:
+        g.dpr_silence_night = malam_bungkam
     await interaction.response.send_message("⚙️ Pengaturan disimpan.", ephemeral=True)
     await g.refresh_lobby()
 
@@ -1371,6 +1528,8 @@ async def role_night(interaction: discord.Interaction, role: app_commands.Choice
         g.wolf_kill_night = malam
     elif key == "serial_killer":
         g.sk_kill_night = malam
+    elif key == "dpr":
+        g.dpr_silence_night = malam
     elif malam == 1:
         g.role_start_night.pop(key, None)
     else:
