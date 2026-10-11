@@ -2,7 +2,10 @@
 Werewolf Discord Bot  (v2 — Tim Werewolf, Warga, dan Netral)
 -----------------------------------------------------------
 - Lobby dengan tombol Join / Leave / Start
+- Host bisa pilih ikut main atau spectate (tombol 👁️ Spectate)
 - Role bisa ditambah / dihapus (/ww role add|remove|auto|list) untuk balancing
+- Host bisa atur Werewolf boleh membunuh mulai malam ke-berapa (/ww setting malam_bunuh:N)
+- Role TIDAK diumumkan saat pemain mati (tetap rahasia sampai game selesai)
 - Channel private khusus Werewolf dengan select menu korban
 - Semua role dengan aksi malam memakai UI interaktif yang hanya terlihat oleh pemainnya (ephemeral)
 - Malam -> Siang (diskusi + pemerasan/bungkam) -> Voting, otomatis sampai ada pemenang
@@ -34,6 +37,7 @@ logging.basicConfig(level=logging.INFO)
 MIN_PLAYERS = int(os.getenv("MIN_PLAYERS", "4"))
 MAX_PLAYERS = 24  # select menu Discord maks 25 opsi (24 pemain + opsi "skip")
 LOCK_CHAT_AT_NIGHT = os.getenv("LOCK_CHAT_AT_NIGHT", "1") == "1"
+WOLF_KILL_NIGHT = max(1, int(os.getenv("WOLF_KILL_NIGHT", "1")))  # Werewolf boleh membunuh mulai malam ke-N
 HUNTER_TIME = 30
 WITCH_TIME = 30
 
@@ -330,8 +334,31 @@ class LobbyView(discord.ui.View):
         if g.state != "lobby" or interaction.user.id not in g.players:
             return await interaction.response.send_message("Kamu tidak ada di lobby.", ephemeral=True)
         if interaction.user.id == g.host.id:
-            return await interaction.response.send_message("Host tidak bisa keluar. Pakai `/ww cancel`.", ephemeral=True)
+            return await interaction.response.send_message(
+                "Host tidak bisa keluar. Pakai tombol 👁️ **Spectate** atau `/ww cancel`.", ephemeral=True)
         del g.players[interaction.user.id]
+        await interaction.response.edit_message(embed=g.lobby_embed(), view=self)
+
+    @discord.ui.button(label="Spectate", emoji="👁️", style=discord.ButtonStyle.secondary)
+    async def spectate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Host bisa pilih ikut main atau hanya spectate."""
+        g = self.game
+        if g.state != "lobby":
+            return await interaction.response.send_message("Game sudah berjalan.", ephemeral=True)
+        if interaction.user.id != g.host.id:
+            return await interaction.response.send_message("Hanya host yang bisa mengubah ini.", ephemeral=True)
+        if g.host_playing:
+            g.host_playing = False
+            g.players.pop(g.host.id, None)
+            button.label = "Ikut Main"
+            button.emoji = "🎮"
+        else:
+            if len(g.players) >= MAX_PLAYERS:
+                return await interaction.response.send_message("Lobby penuh.", ephemeral=True)
+            g.host_playing = True
+            g.players[g.host.id] = Player(g.host)
+            button.label = "Spectate"
+            button.emoji = "👁️"
         await interaction.response.edit_message(embed=g.lobby_embed(), view=self)
 
     @discord.ui.button(label="Start", emoji="▶️", style=discord.ButtonStyle.primary)
@@ -354,6 +381,9 @@ class Game:
         self.state = "lobby"            # lobby / running / ended
         self.custom_roles: Optional[dict[str, int]] = None
         self.night_time, self.day_time, self.vote_time = 60, 90, 45
+        self.host_playing = True        # host ikut main / spectate
+        self.wolf_kill_night = WOLF_KILL_NIGHT  # Werewolf boleh membunuh mulai malam ke-N
+        self.wolf_active_night = False  # di-set tiap malam di night_phase
         self.lobby_message: Optional[discord.Message] = None
         self.wolf_channel: Optional[discord.TextChannel] = None
         self.task: Optional[asyncio.Task] = None
@@ -423,7 +453,10 @@ class Game:
 
     def lobby_embed(self) -> discord.Embed:
         e = discord.Embed(title="🐺 Werewolf — Lobby", color=discord.Color.dark_red())
-        e.description = f"Host: {self.host.mention}\nKlik **Join** untuk ikut. Host menekan **Start** jika sudah siap."
+        host_mode = "🎮 ikut main" if self.host_playing else "👁️ spectate"
+        e.description = (f"Host: {self.host.mention} ({host_mode})\n"
+                         "Klik **Join** untuk ikut. Host menekan **Start** jika sudah siap.\n"
+                         "Host bisa pakai tombol **👁️ Spectate** untuk tidak ikut main.")
         plist = "\n".join(f"{i}. {p.member.mention}" for i, p in enumerate(self.players.values(), 1))
         e.add_field(name=f"Pemain ({len(self.players)}/{MAX_PLAYERS})", value=plist or "-", inline=False)
         mode = "otomatis" if self.custom_roles is None else "kustom"
@@ -431,7 +464,8 @@ class Game:
         err = self.validate(self.role_plan()) if len(self.players) >= MIN_PLAYERS else None
         if err:
             e.add_field(name="⚠️ Perhatian", value=err, inline=False)
-        e.set_footer(text=f"Malam {self.night_time}s • Diskusi {self.day_time}s • Voting {self.vote_time}s  |  /ww role add|remove|auto")
+        e.set_footer(text=f"Malam {self.night_time}s • Diskusi {self.day_time}s • Voting {self.vote_time}s • "
+                          f"🐺 bunuh mulai malam ke-{self.wolf_kill_night}  |  /ww role add|remove|auto")
         return e
 
     async def refresh_lobby(self):
@@ -581,7 +615,9 @@ class Game:
         if self.stage == "night":
             need = [p for p in self.alive() if p.role in NIGHT_REQUIRED]
             blamers = [p for p in self.alive_role("blamer") if not p.blame_targets] if self.round == 1 else []
-            done = (all(w.id in self.wolf_votes for w in self.alive_pack())
+            # di malam saat Werewolf belum boleh membunuh, vote korban tidak ditunggu
+            wolves_ok = True if not self.wolf_active_night else all(w.id in self.wolf_votes for w in self.alive_pack())
+            done = (wolves_ok
                     and all(p.id in self.acted for p in need) and not blamers)
         elif self.stage == "witch":
             done = all(w.id in self.acted for w in self.witches_needed())
@@ -647,9 +683,15 @@ class Game:
         self.witch_poisons.clear()
         self.bm_pending.clear()
         self.blackmails.clear()
-        self.kills = 2 if self.kid_revenge else 1
-        revenge = self.kid_revenge
-        self.kid_revenge = False
+        # Werewolf hanya boleh membunuh mulai malam ke-wolf_kill_night
+        self.wolf_active_night = self.round >= self.wolf_kill_night
+        if self.wolf_active_night:
+            self.kills = 2 if self.kid_revenge else 1
+            revenge = self.kid_revenge
+            self.kid_revenge = False
+        else:
+            self.kills = 0
+            revenge = False  # balas dendam Werewolf Kid disimpan sampai malam boleh membunuh
 
         await self.set_lock(True)
         e = discord.Embed(title=f"🌙 Malam ke-{self.round}", color=discord.Color.dark_blue(),
@@ -659,13 +701,17 @@ class Game:
 
         wolf_msg = None
         pack = self.alive_pack()
-        if pack:
+        if pack and self.wolf_active_night:
             targets = [p for p in self.alive() if p.role not in PACK]
             txt = f"🌙 **Malam ke-{self.round}** — pilih korban {fmt_time(self.night_time)}.\nSuara terbanyak dipakai (seri = acak)."
             if revenge:
                 txt += "\n🩸 **Werewolf Kid telah dibakar!** Malam ini kalian boleh memakan **2 korban**."
             if targets:
                 wolf_msg = await self.wolf_channel.send(txt, view=WolfVoteView(self, targets, self.kills))
+        elif pack:
+            await self.wolf_channel.send(
+                f"🌙 **Malam ke-{self.round}** — Werewolf belum boleh membunuh "
+                f"(baru boleh mulai malam ke-{self.wolf_kill_night}). Manfaatkan waktu untuk menyusun strategi! 😴")
 
         self.stage = "night"
         self.event.clear()
@@ -718,7 +764,8 @@ class Game:
             p = self.players[pid]
             p.alive = False
             await self.mute(p)
-            lines.append(f"💀 {p.member.mention} ditemukan tewas. Ternyata dia **{p.info.emoji} {p.info.name}**.")
+            # role TIDAK diumumkan — tetap rahasia sampai game selesai
+            lines.append(f"💀 {p.member.mention} ditemukan tewas.")
         e.description = "\n".join(lines) if lines else "✨ Malam ini tidak ada yang tewas."
 
         # DPR membungkam
@@ -785,7 +832,8 @@ class Game:
             p = self.players[lynched]
             p.alive = False
             await self.mute(p)
-            e.add_field(name="Hasil", value=f"🔥 {p.member.mention} di-lynch! Dia adalah **{p.info.emoji} {p.info.name}**.")
+            # role TIDAK diumumkan — tetap rahasia sampai game selesai
+            e.add_field(name="Hasil", value=f"🔥 {p.member.mention} di-lynch!")
             await self.say(embed=e)
 
             if p.role == "tanner":
@@ -807,7 +855,8 @@ class Game:
                 t.alive = False
                 await self.mute(t)
                 killed.append(t.id)
-                lines.append(f"😈 {t.member.mention} tidak mematuhi perintah pemeras dan **dibunuh**! Dia adalah **{t.info.emoji} {t.info.name}**.")
+                # role TIDAK diumumkan — tetap rahasia sampai game selesai
+                lines.append(f"😈 {t.member.mention} tidak mematuhi perintah pemeras dan **dibunuh**!")
         self.blackmails.clear()
         if lines:
             await self.say(embed=discord.Embed(title="🩸 Korban Pemerasan", description="\n".join(lines), color=discord.Color.dark_red()))
@@ -853,7 +902,8 @@ class Game:
             t = self.players[self.hunter_choice]
             t.alive = False
             await self.mute(t)
-            await self.say(f"💥 {h.member.mention} menembak {t.member.mention}! Dia adalah **{t.info.emoji} {t.info.name}**.")
+            # role TIDAK diumumkan — tetap rahasia sampai game selesai
+            await self.say(f"💥 {h.member.mention} menembak {t.member.mention} hingga tewas!")
             if t.role == "hunter":
                 queue.append(t.id)
 
@@ -1177,23 +1227,28 @@ async def ww_status(interaction: discord.Interaction):
     if not g:
         return await interaction.response.send_message("Tidak ada game di channel ini.", ephemeral=True)
     alive = ", ".join(p.member.mention for p in g.alive()) or "-"
-    dead = ", ".join(f"{p.member.mention} ({p.info.emoji})" for p in g.players.values() if not p.alive) or "-"
+    # role pemain yang mati TIDAK ditampilkan — tetap rahasia sampai game selesai
+    dead = ", ".join(f"💀 {p.member.mention}" for p in g.players.values() if not p.alive) or "-"
     await interaction.response.send_message(
         f"**Status:** {g.state} • Ronde {g.round}\n❤️ Hidup: {alive}\n💀 Mati: {dead}", ephemeral=True)
 
 
-@ww.command(name="setting", description="Atur durasi fase (detik) — host, saat lobby")
-@app_commands.describe(malam="Durasi malam", diskusi="Durasi diskusi", voting="Durasi voting")
+@ww.command(name="setting", description="Atur durasi fase & malam mulai Werewolf boleh membunuh (host, saat lobby)")
+@app_commands.describe(malam="Durasi malam", diskusi="Durasi diskusi", voting="Durasi voting",
+                       malam_bunuh="Werewolf boleh membunuh mulai malam ke-berapa")
 async def ww_setting(interaction: discord.Interaction,
                      malam: Optional[app_commands.Range[int, 20, 300]] = None,
                      diskusi: Optional[app_commands.Range[int, 20, 600]] = None,
-                     voting: Optional[app_commands.Range[int, 15, 300]] = None):
+                     voting: Optional[app_commands.Range[int, 15, 300]] = None,
+                     malam_bunuh: Optional[app_commands.Range[int, 1, 10]] = None):
     g = await lobby_game_for_host(interaction)
     if not g:
         return
     g.night_time = malam or g.night_time
     g.day_time = diskusi or g.day_time
     g.vote_time = voting or g.vote_time
+    if malam_bunuh:
+        g.wolf_kill_night = malam_bunuh
     await interaction.response.send_message("⚙️ Pengaturan disimpan.", ephemeral=True)
     await g.refresh_lobby()
 
@@ -1226,7 +1281,6 @@ async def role_remove(interaction: discord.Interaction, role: app_commands.Choic
     if not g:
         return
     base = _base(g)
-    cur = base.get(role.value, 0)
     base[role.value] = 0 if jumlah is None else max(0, cur - jumlah)
     g.custom_roles = {k: v for k, v in base.items() if v > 0}
     await interaction.response.send_message(f"➖ {ROLES[role.value].name} dikurangi.\n{g.plan_text()}", ephemeral=True)
